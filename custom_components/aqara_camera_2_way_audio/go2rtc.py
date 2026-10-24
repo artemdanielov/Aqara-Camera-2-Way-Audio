@@ -25,6 +25,8 @@ from .const import RTSP_PORT
 _LOGGER = logging.getLogger(__name__)
 
 GO2RTC_CONFIG_FILE = "go2rtc.yaml"
+_LEGACY_EXEC_SUFFIX = "#backchannel=1"
+_EXEC_SUFFIX = "#backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10"
 
 # Serialises read-modify-write on go2rtc.yaml across threads (the integration
 # dispatches register_stream/remove_stream via hass.async_add_executor_job, so
@@ -69,9 +71,9 @@ def build_exec_source(config_dir: str, camera_ip: str) -> str:
     """Build the go2rtc exec source URL for the backchannel bridge.
 
     The exec source tells go2rtc to spawn the bridge script when a browser
-    microphone connects. HA's bundled go2rtc uses stdin.NewClient which
-    hardcodes PCMA/8kHz for backchannel audio (the #audio= parameter is
-    ignored despite the binary reporting as v1.9.14).
+    microphone connects. Explicit PCMA/8kHz matches the bridge's A-law
+    decoder. SIGTERM lets its existing cleanup send STOP_VOICE, with a
+    ten-second graceful-stop wait limit on go2rtc builds supporting it.
 
     go2rtc uses exec.Command (not a shell), so we pass the absolute script
     path. go2rtc's ParseQuery splits on # (not &) for multiple parameters.
@@ -86,7 +88,7 @@ def build_exec_source(config_dir: str, camera_ip: str) -> str:
         / "aqara_camera_2_way_audio"
         / "bridge.py"
     )
-    return f"exec:{python} {bridge_script} {camera_ip}#backchannel=1"
+    return f"exec:{python} {bridge_script} {camera_ip}{_EXEC_SUFFIX}"
 
 
 def build_rtsp_source(
@@ -127,7 +129,7 @@ def register_stream(
                 # Refuse to clobber if the existing entry is plausibly not
                 # ours. An entry whose exec source does not match ours
                 # belongs to another camera (or another integration).
-                if not _stream_belongs_to_us(existing, sources):
+                if not _stream_belongs_to_us(existing, sources, config_dir):
                     _LOGGER.warning(
                         "go2rtc stream %s already exists with different sources "
                         "(possible collision). Not overwriting.",
@@ -149,7 +151,9 @@ def register_stream(
         return "error"
 
 
-def _stream_belongs_to_us(existing_sources: list[str], our_sources: list[str]) -> bool:
+def _stream_belongs_to_us(
+    existing_sources: list[str], our_sources: list[str], config_dir: str
+) -> bool:
     """Heuristic: same stream name belongs to us if our exec source matches.
 
     The exec source encodes the bridge.py absolute path and the camera IP,
@@ -158,7 +162,19 @@ def _stream_belongs_to_us(existing_sources: list[str], our_sources: list[str]) -
     our_exec = next((s for s in our_sources if s.startswith("exec:")), None)
     if our_exec is None:
         return False
-    return our_exec in existing_sources
+    if our_exec in existing_sources:
+        return True
+
+    # Upgrade only the exact former output of this integration's builder.
+    # Rebuild against this config directory and interpreter before accepting
+    # the legacy suffix; never strip options from arbitrary caller commands.
+    camera_ip = our_exec.rsplit(" ", 1)[-1].partition("#")[0]
+    if not camera_ip or any(c.isspace() for c in camera_ip):
+        return False
+    if our_exec != build_exec_source(config_dir, camera_ip):
+        return False
+    legacy_exec = our_exec.removesuffix(_EXEC_SUFFIX) + _LEGACY_EXEC_SUFFIX
+    return legacy_exec in existing_sources
 
 
 def remove_stream(config_dir: str, stream_name: str) -> None:

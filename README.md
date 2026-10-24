@@ -95,6 +95,10 @@ Camera microphone
 
 The integration writes a go2rtc stream containing three sources (RTSP, ffmpeg transcode, exec bridge) to `go2rtc.yaml`. After install or after changing the 2-way audio channel in options, restart Home Assistant so go2rtc rereads the file.
 
+The generated exec source explicitly requests `#backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10`: A-law at 8 kHz matches the bridge decoder, SIGTERM lets the existing cleanup send `STOP_VOICE`, and the ten-second timeout bounds the graceful-stop wait. Exact legacy entries generated for the same Python executable, bridge path and camera are upgraded on registration; customized or conflicting commands are left untouched.
+
+The running go2rtc server must actually load this configuration and permit the bridge executable. These flags do not bypass configuration loading or executable-access restrictions (including Home Assistant launch configurations that allow only ffmpeg). go2rtc variants that ignore these options have not been validated.
+
 ### Dashboard card
 
 Add a [WebRTC Camera](https://github.com/AlexxIT/WebRTC) card to your dashboard:
@@ -206,7 +210,7 @@ streams:
   aqara_camera_192_0_2_10:
     - rtsp://user:pass@192.0.2.10:8554/ch1
     - "ffmpeg:aqara_camera_192_0_2_10#video=copy#audio=opus#audio=copy"
-    - "exec:/usr/local/bin/python3 /config/custom_components/aqara_camera_2_way_audio/bridge.py 192.0.2.10#backchannel=1"
+    - "exec:/usr/local/bin/python3 /config/custom_components/aqara_camera_2_way_audio/bridge.py 192.0.2.10#backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10"
 ```
 
 Don't forget the router-side step: forward **UDP 8555** to the Home Assistant host (only required for the public-IP option, not for TURN). Restart Home Assistant after any edit to `go2rtc.yaml` so go2rtc reloads.

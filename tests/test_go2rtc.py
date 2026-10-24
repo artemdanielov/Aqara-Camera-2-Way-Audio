@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from custom_components.aqara_camera_2_way_audio import go2rtc as go2rtc_mod
@@ -40,6 +42,16 @@ class TestBuildExecSource:
         assert "aqara_camera_2_way_audio/bridge.py" in src
         assert "aqara_doorbell" not in src
         assert "10.0.0.1#backchannel=1" in src
+
+    def test_explicit_audio_and_graceful_stop_preserve_command(self) -> None:
+        with patch.object(go2rtc_mod.sys, "executable", "/usr/bin/python3"):
+            src = build_exec_source("/config", "10.0.0.1")
+        command, options = src.split("#", 1)
+        assert command == (
+            "exec:/usr/bin/python3 "
+            "/config/custom_components/aqara_camera_2_way_audio/bridge.py 10.0.0.1"
+        )
+        assert options == "backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10"
 
 
 class TestRegisterStream:
@@ -96,6 +108,114 @@ class TestRegisterStream:
         assert result == "skipped"
         parsed = yaml.safe_load((tmp_path / "go2rtc.yaml").read_text())
         assert parsed["streams"]["aqara_camera_10_0_0_1"] == ["rtsp://other-owner"]
+
+
+class TestLegacyMigration:
+    """Only the exact previously generated command is eligible for upgrade."""
+
+    @pytest.fixture
+    def generated_sources(self, tmp_path: Path) -> Iterator[tuple[str, str]]:
+        with patch.object(go2rtc_mod.sys, "executable", "/usr/bin/python3"):
+            command = (
+                "exec:/usr/bin/python3 "
+                f"{tmp_path}/custom_components/aqara_camera_2_way_audio/bridge.py 10.0.0.1"
+            )
+            yield (
+                command + "#backchannel=1",
+                command + "#backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10",
+            )
+
+    def test_upgrades_legacy_and_then_noops(
+        self, tmp_path: Path, generated_sources: tuple[str, str]
+    ) -> None:
+        legacy, current = generated_sources
+        path = tmp_path / "go2rtc.yaml"
+        config = {
+            "api": {"listen": "127.0.0.1:1984"},
+            "webrtc": {"candidates": ["stun:auto"]},
+            "streams": {
+                "camera": ["rtsp://old-channel", legacy],
+                "other": ["rtsp://unrelated"],
+            },
+        }
+        path.write_text(yaml.safe_dump(config))
+        sources = ["rtsp://new-channel", "ffmpeg:camera#audio=opus", current]
+        assert register_stream(str(tmp_path), "camera", sources) == "wrote"
+        config["streams"]["camera"] = sources
+        assert yaml.safe_load(path.read_text()) == config
+        first = path.read_bytes()
+        with patch.object(go2rtc_mod, "_write_config") as write:
+            assert register_stream(str(tmp_path), "camera", sources) == "noop"
+        write.assert_not_called()
+        assert path.read_bytes() == first
+
+    @pytest.mark.parametrize(
+        ("old", "new"),
+        [
+            ("10.0.0.1#", "10.0.0.2#"),
+            ("/bridge.py", "/different.py"),
+            ("/aqara_camera_2_way_audio/", "/another_component/"),
+            ("/usr/bin/python3", "/usr/bin/python"),
+            ("#backchannel=1", "#backchannel=1#custom=1"),
+            ("#backchannel=1", "#backchannel=1#audio=pcma/8000"),
+            ("#backchannel=1", "#backchannel=1#audio=pcm/16000"),
+            ("#backchannel=1", "#audio=pcma/8000#backchannel=1"),
+            ("#backchannel=1", "#backchannel=1#killsignal=9"),
+        ],
+    )
+    def test_foreign_or_customized_entry_is_untouched(
+        self, tmp_path: Path, generated_sources: tuple[str, str], old: str, new: str
+    ) -> None:
+        legacy, current = generated_sources
+        self._assert_skipped(tmp_path, legacy.replace(old, new), current)
+
+    @pytest.mark.parametrize(
+        ("old", "new"),
+        [
+            ("/usr/bin/python3", "/usr/bin/python"),
+            ("/bridge.py", "/custom/bridge.py"),
+            ("#backchannel=1", "#backchannel=1#custom=1"),
+        ],
+    )
+    def test_custom_requested_command_cannot_claim_legacy_entry(
+        self, tmp_path: Path, generated_sources: tuple[str, str], old: str, new: str
+    ) -> None:
+        legacy, current = generated_sources
+        self._assert_skipped(tmp_path, legacy.replace(old, new), current.replace(old, new))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "exec:/usr/bin/python3 /arbitrary/bridge.py 10.0.0.1",
+            "exec:/usr/bin/python3 /config/custom_components/aqara_camera_2_way_audio/bridge.py 10.0.0.1",
+            "exec:arbitrary-command argument",
+        ],
+    )
+    def test_generic_callers_do_not_gain_legacy_ownership(
+        self, tmp_path: Path, command: str
+    ) -> None:
+        self._assert_skipped(
+            tmp_path,
+            command + "#backchannel=1",
+            command + "#backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10",
+        )
+
+    def test_direct_match_still_allows_update(self, tmp_path: Path) -> None:
+        path = tmp_path / "go2rtc.yaml"
+        path.write_text(yaml.safe_dump({"streams": {"camera": ["rtsp://old", "exec:custom"]}}))
+        sources = ["rtsp://new", "exec:custom"]
+        assert register_stream(str(tmp_path), "camera", sources) == "wrote"
+        assert yaml.safe_load(path.read_text())["streams"]["camera"] == sources
+
+    @staticmethod
+    def _assert_skipped(tmp_path: Path, existing: str, desired: str) -> None:
+        path = tmp_path / "go2rtc.yaml"
+        path.write_text(yaml.safe_dump({"streams": {"camera": ["rtsp://old", existing]}}))
+        before = path.read_bytes()
+        with patch.object(go2rtc_mod, "_write_config") as write:
+            assert register_stream(str(tmp_path), "camera", ["rtsp://new", desired]) == "skipped"
+        write.assert_not_called()
+        assert path.read_bytes() == before
 
 
 class TestRemoveStream:
