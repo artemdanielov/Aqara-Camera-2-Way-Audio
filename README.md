@@ -97,6 +97,8 @@ The integration writes a go2rtc stream containing three sources (RTSP, ffmpeg tr
 
 The generated exec source explicitly requests `#backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10`: A-law at 8 kHz matches the bridge decoder, SIGTERM lets the existing cleanup send `STOP_VOICE`, and the ten-second timeout bounds the graceful-stop wait. Exact legacy entries generated for the same Python executable, bridge path and camera are upgraded on registration; customized or conflicting commands are left untouched.
 
+An existing source with exactly these four options in a different order is retained without rewriting the file, provided the command and all other sources match. Duplicate or unknown options, changed companion sources, and multiple exec producers do not qualify for this equivalence check. Malformed entries are not overwritten, and registration errors omit exception text that could expose RTSP credentials.
+
 The running go2rtc server must actually load this configuration and permit the bridge executable. These flags do not bypass configuration loading or executable-access restrictions (including Home Assistant launch configurations that allow only ffmpeg). go2rtc variants that ignore these options have not been validated.
 
 ### Dashboard card

@@ -15,7 +15,9 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from collections import Counter
 from pathlib import Path
+from typing import TypeGuard
 from urllib.parse import quote
 
 import yaml
@@ -60,7 +62,8 @@ def _read_config(config_path: Path) -> dict:
         raw = config_path.read_text()
     except FileNotFoundError:
         return {}
-    return yaml.safe_load(raw) or {}
+    config = yaml.safe_load(raw)
+    return {} if config is None else config
 
 
 def _write_config(config_path: Path, config: dict) -> None:
@@ -109,7 +112,7 @@ def register_stream(
 
     Returns one of:
       - "wrote": new content written
-      - "noop": this exact stream + sources already in the file
+      - "noop": exact sources or equivalent bridge options already in the file
       - "skipped": a stream by this name exists with different sources NOT
         matching ours -- treated as a collision with another integration
         or another camera entry; do not overwrite
@@ -117,19 +120,35 @@ def register_stream(
     """
     config_path = Path(config_dir) / GO2RTC_CONFIG_FILE
     try:
+        if not _valid_sources(sources):
+            raise ValueError("Invalid requested source types")
         with _CONFIG_LOCK:
             config = _read_config(config_path)
+            if not isinstance(config, dict):
+                raise ValueError("Invalid config type")
             streams = config.setdefault("streams", {})
+            if not isinstance(streams, dict):
+                raise ValueError("Invalid streams type")
             existing = streams.get(stream_name)
 
-            if existing is not None:
-                if set(existing) == set(sources):
+            if stream_name in streams:
+                if _valid_sources(existing) and Counter(existing) == Counter(sources):
                     _LOGGER.debug("go2rtc stream %s already current", stream_name)
+                    return "noop"
+                # Retain equivalent option orderings without rewriting YAML or
+                # treating them as ownership for a subsequent update.
+                if _is_retained_customization(existing, sources):
+                    _LOGGER.debug("go2rtc stream %s bridge options retained", stream_name)
                     return "noop"
                 # Refuse to clobber if the existing entry is plausibly not
                 # ours. An entry whose exec source does not match ours
                 # belongs to another camera (or another integration).
-                if not _stream_belongs_to_us(existing, sources, config_dir):
+                if (
+                    not _valid_sources(existing)
+                    or sum(s.startswith("exec:") for s in existing) != 1
+                    or sum(s.startswith("exec:") for s in sources) != 1
+                    or not _stream_belongs_to_us(existing, sources, config_dir)
+                ):
                     _LOGGER.warning(
                         "go2rtc stream %s already exists with different sources "
                         "(possible collision). Not overwriting.",
@@ -146,9 +165,37 @@ def register_stream(
         )
         return "wrote"
 
-    except Exception:
-        _LOGGER.warning("Failed to write go2rtc config", exc_info=True)
+    except Exception as err:
+        # YAML exceptions can embed credential-bearing source lines.
+        _LOGGER.warning("Failed to write go2rtc config (%s)", type(err).__name__)
         return "error"
+
+
+def _valid_sources(sources: object) -> TypeGuard[list[str]]:
+    """Validate source types before comparisons or string operations."""
+    return isinstance(sources, list) and all(isinstance(s, str) for s in sources)
+
+
+def _is_retained_customization(existing: object, sources: list[str]) -> bool:
+    """Retain only equivalent options on the same command and other sources."""
+    if not _valid_sources(existing):
+        return False
+    our_exec = [s for s in sources if s.startswith("exec:")]
+    old_exec = [s for s in existing if s.startswith("exec:")]
+    if len(our_exec) != 1 or len(old_exec) != 1:
+        return False
+    command, separator, params = our_exec[0].partition("#")
+    if separator != "#" or "#" + params != _EXEC_SUFFIX:
+        return False
+    old_command, separator, old_params = old_exec[0].partition("#")
+    if separator != "#" or old_command != command:
+        return False
+    # Compare raw tokens, rejecting duplicate, unknown or altered options.
+    if Counter(old_params.split("#")) != Counter(params.split("#")):
+        return False
+    return Counter(s for s in existing if not s.startswith("exec:")) == Counter(
+        s for s in sources if not s.startswith("exec:")
+    )
 
 
 def _stream_belongs_to_us(
