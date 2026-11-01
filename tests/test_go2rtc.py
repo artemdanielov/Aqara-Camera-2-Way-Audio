@@ -136,13 +136,13 @@ class TestLegacyMigration:
             "api": {"listen": "127.0.0.1:1984"},
             "webrtc": {"candidates": ["stun:auto"]},
             "streams": {
-                "camera": ["rtsp://old-channel", legacy],
+                "camera": ["rtsp://new-channel", "ffmpeg:camera#audio=opus", legacy],
                 "other": ["rtsp://unrelated"],
             },
         }
         path.write_text(yaml.safe_dump(config))
         sources = ["rtsp://new-channel", "ffmpeg:camera#audio=opus", current]
-        assert register_stream(str(tmp_path), "camera", sources) == "wrote"
+        assert register_stream(str(tmp_path), "camera", sources, "10.0.0.1") == "wrote"
         config["streams"]["camera"] = sources
         assert yaml.safe_load(path.read_text()) == config
         first = path.read_bytes()
@@ -202,12 +202,12 @@ class TestLegacyMigration:
             command + "#backchannel=1#audio=pcma/8000#killsignal=15#killtimeout=10",
         )
 
-    def test_direct_match_still_allows_update(self, tmp_path: Path) -> None:
+    def test_exec_match_alone_does_not_allow_update(self, tmp_path: Path) -> None:
         path = tmp_path / "go2rtc.yaml"
         path.write_text(yaml.safe_dump({"streams": {"camera": ["rtsp://old", "exec:custom"]}}))
         sources = ["rtsp://new", "exec:custom"]
-        assert register_stream(str(tmp_path), "camera", sources) == "wrote"
-        assert yaml.safe_load(path.read_text())["streams"]["camera"] == sources
+        assert register_stream(str(tmp_path), "camera", sources) == "skipped"
+        assert yaml.safe_load(path.read_text())["streams"]["camera"] == ["rtsp://old", "exec:custom"]
 
     @staticmethod
     def _assert_skipped(tmp_path: Path, existing: str, desired: str) -> None:
@@ -367,7 +367,7 @@ class TestRemoveStream:
             "other_stream": ["rtsp://existing"],
         }}
         (tmp_path / "go2rtc.yaml").write_text(yaml.dump(existing))
-        remove_stream(str(tmp_path), "aqara_camera_10_0_0_1")
+        remove_stream(str(tmp_path), "aqara_camera_10_0_0_1", go2rtc_mod.sources_digest(["rtsp://x"]))
         parsed = yaml.safe_load((tmp_path / "go2rtc.yaml").read_text())
         assert "aqara_camera_10_0_0_1" not in parsed["streams"]
         assert parsed["streams"]["other_stream"] == ["rtsp://existing"]
